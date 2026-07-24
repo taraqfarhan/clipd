@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import signal
+import hashlib
+import shutil
+
+# --- Directory & File Path Setup ---
+CONFIG_DIR = os.path.expanduser("~/.config/clipd")
+STATE_PATH = os.path.join(CONFIG_DIR, "state.json")
+HISTORY_PATH = os.path.join(CONFIG_DIR, "history.json")
+
+os.makedirs(CONFIG_DIR, exist_ok=True)
+
+# --- Custom Help String ---
+CUSTOM_HELP = r"""
+clipd: macOS clipboard history daemon
+
+usage: clipd [commands]
+
+Commands:
+  watch             start the background daemon to record clipboard history
+  stop              stop the active clipd daemon
+  status            check if the daemon is running and see history count
+  list              show all items copied to the clipboard (up to 100)
+  paste [id]        paste an item back to clipboard. If no id provided, uses fzf
+  search <query>    search your clipboard history for a keyword
+  remove <id>       delete a specific item from history
+  echo <id>         print a text item directly to stdout (for piping)
+  reset             clear the entire clipboard history
+
+Options:
+  -h, --help        show this help message and exit
+"""
+
+# --- State & History Management ---
+
+def load_json(path, default=None):
+    if not os.path.exists(path):
+        return default if default is not None else {}
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return default if default is not None else {}
+
+def save_json(path, data):
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=4)
+
+def load_state():
+    return load_json(STATE_PATH, {})
+
+def save_state(pid=None, last_hash=None):
+    state = load_state()
+    if pid is not None:
+        state["pid"] = pid
+    if last_hash is not None:
+        state["last_hash"] = last_hash
+    save_json(STATE_PATH, state)
+
+def load_history():
+    return load_json(HISTORY_PATH, [])
+
+def save_history(history):
+    # Keep only the last 100 items to prevent infinite growth
+    if len(history) > 100:
+        history = history[-100:]
+    save_json(HISTORY_PATH, history)
+    
+def add_to_history(item):
+    """Inserts item at the top (index 0) and removes any older duplicates."""
+    history = load_history()
+    # Remove any existing items with the exact same content
+    history = [h for h in history if h.get("content") != item.get("content")]
+    # Insert at the very top
+    history.insert(0, item)
+    # Enforce limit
+    if len(history) > 100:
+        history = history[:100]
+    save_history(history)
+
+# --- macOS Clipboard Interfacing ---
+
+def get_clipboard_hash():
+    """Gets a quick hash of the clipboard metadata to detect changes."""
+    try:
+        res = subprocess.run(['osascript', '-e', 'clipboard info'], capture_output=True, text=True)
+        return hashlib.md5(res.stdout.encode('utf-8')).hexdigest()
+    except Exception:
+        return None
+
+def extract_clipboard_content():
+    """Uses AppleScript to extract the actual content from the clipboard."""
+    script = '''
+    set output to "NONE:"
+    set clipInfo to clipboard info
+    
+    set isFile to false
+    set isImg to false
+    set isText to false
+    
+    repeat with info in clipInfo
+        set tid to item 1 of info
+        if tid is «class furl» then set isFile to true
+        if tid is «class PNGf» then set isImg to true
+        if tid is «class utf8» then set isText to true
+    end repeat
+    
+    -- 1. If it has a File URL (e.g. from Finder)
+    if isFile then
+        try
+            set f to the clipboard as «class furl»
+            if (class of f) is list then
+                set out to ""
+                repeat with i in f
+                    set out to out & (POSIX path of i) & "|"
+                end repeat
+                if out ends with "|" then set out to text 1 thru -2 of out
+                set output to "FILE:" & out
+            else
+                set output to "FILE:" & (POSIX path of f)
+            end if
+        end try
+    end if
+    
+    -- 2. If not a file, but has an Image (e.g. from Web Browser)
+    if output is "NONE:" and isImg then
+        try
+            set imgData to the clipboard as «class PNGf»
+            set ts to do shell script "date +%s"
+            set filePath to "/tmp/clipd_" & ts & ".png"
+            set fh to open for access filePath with write permission
+            write imgData to fh
+            close access fh
+            set output to "FILE:" & filePath
+        end try
+    end if
+    
+    -- 3. If not an image, but has Text
+    if output is "NONE:" and isText then
+        try
+            set t to the clipboard as text
+            set output to "TEXT:" & t
+        end try
+    end if
+    
+    return output
+    '''
+    try:
+        res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
+        out = res.stdout.strip()
+        if out.startswith("FILE:"):
+            return "FILE", out[5:].split('|')
+        elif out.startswith("TEXT:"):
+            return "TEXT", [out[5:]]
+        else:
+            return None, None
+    except Exception:
+        return None, None
+
+def categorize_item(content_type, content_data):
+    """Formats the clipboard data into a structured history item."""
+    timestamp = int(time.time())
+    
+    if content_type == "FILE":
+        paths = content_data
+        if len(paths) == 1:
+            path = paths[0]
+            
+            # SAFETY NET: If the "file" doesn't exist on disk, macOS likely misinterpreted text as a file path!
+            if not os.path.exists(path):
+                text = path
+                preview = text.replace("\n", " ").strip()
+                preview = preview[:60] + ("..." if len(preview) > 60 else "")
+                return {
+                    "id": timestamp,
+                    "type": "Text",
+                    "preview": preview,
+                    "content": text
+                }
+                
+            filename = os.path.basename(path)
+            return {
+                "id": timestamp,
+                "type": "File",
+                "preview": filename[:60] + ("..." if len(filename) > 60 else ""),
+                "content": path
+            }
+        else:
+            # Multiple files
+            return {
+                "id": timestamp,
+                "type": "File",
+                "preview": f"{len(paths)} files copied",
+                "content": "|".join(paths)
+            }
+            
+    elif content_type == "TEXT":
+        text = content_data[0]
+        preview = text.replace("\n", " ").strip()
+        preview = preview[:60] + ("..." if len(preview) > 60 else "")
+        return {
+            "id": timestamp,
+            "type": "Text",
+            "preview": preview,
+            "content": text
+        }
+    return None
+
+# --- Daemon Logic ---
+
+def run_daemon():
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+    devnull_r = open(os.devnull, 'r')
+    devnull_w = open(os.devnull, 'a+')
+    os.dup2(devnull_r.fileno(), sys.stdin.fileno())
+    os.dup2(devnull_w.fileno(), sys.stdout.fileno())
+    os.dup2(devnull_w.fileno(), sys.stderr.fileno())
+
+    state = load_state()
+    last_hash = state.get("last_hash", "")
+
+    while True:
+        current_hash = get_clipboard_hash()
+        
+        if current_hash and current_hash != last_hash:
+            last_hash = current_hash
+            save_state(last_hash=last_hash)
+            
+            content_type, content_data = extract_clipboard_content()
+            if content_type:
+                item = categorize_item(content_type, content_data)
+                if item:
+                    add_to_history(item)
+                    
+        time.sleep(1.5)
+
+# --- Command Handlers ---
+
+def handle_watch(args):
+    state = load_state()
+    if "pid" in state:
+        try:
+            os.kill(state["pid"], 0)
+            print("  Error: clipd daemon is already running.")
+            sys.exit(1)
+        except ProcessLookupError:
+            pass
+
+    script_path = os.path.realpath(__file__)
+    cmd = [sys.executable, script_path, "--daemon-run"]
+    
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True
+    )
+
+    save_state(pid=proc.pid)
+    print("  clipd daemon started in background. Watching clipboard.")
+    print("  (You can safely close this terminal. The daemon will persist.)")
+    print("  Run 'python3 clipd.py list' to see history.")
+    sys.exit(0)
+
+def handle_stop(args):
+    state = load_state()
+    if "pid" not in state:
+        print("  No active clipd daemon found.")
+        sys.exit(0)
+    
+    try:
+        os.kill(state["pid"], signal.SIGTERM)
+        print("  clipd daemon stopped.")
+    except ProcessLookupError:
+        print("  Daemon was already stopped.")
+    
+    state.pop("pid", None)
+    save_json(STATE_PATH, state)
+    sys.exit(0)
+
+def handle_status(args):
+    state = load_state()
+    if "pid" not in state:
+        print("  clipd daemon is not running.")
+    else:
+        try:
+            os.kill(state["pid"], 0)
+            print("  clipd daemon is running and watching clipboard.")
+        except ProcessLookupError:
+            print("  clipd daemon is not running (it may have crashed).")
+            
+    history = load_history()
+    print(f"  Items in history: {len(history)}")
+
+
+def handle_list(args):
+    history = load_history()
+    if not history:
+        print("  Clipboard history is empty.")
+        sys.exit(0)
+        
+    print("  Clipboard History:\n")
+    
+    for i, item in enumerate(history):
+        print(f"  [{i + 1:02d}] ({item['type']}) {item['preview']}")
+
+
+def handle_search(args):
+    history = load_history()
+    if not history:
+        print("  Clipboard history is empty.")
+        sys.exit(0)
+        
+    query = args.query.lower()
+    print(f"  Search results for '{args.query}':\n")
+    found = 0
+    
+    for i, item in enumerate(history):
+        # Search both the preview and the full content
+        if query in item['preview'].lower() or query in item.get('content', '').lower():
+            print(f"  [{i + 1:02d}] ({item['type']}) {item['preview']}")
+            found += 1
+            
+    if found == 0:
+        print("  No matches found.")
+
+def handle_remove(args):
+    history = load_history()
+    if not history:
+        print("  Clipboard history is empty.")
+        sys.exit(0)
+        
+    list_index = args.index - 1  
+    if list_index < 0 or list_index >= len(history):
+        print(f"  Error: Invalid index. Use a number between 1 and {len(history)}.")
+        sys.exit(1)
+        
+    removed_item = history.pop(list_index)
+    save_history(history)
+    print(f"  Removed item {args.index}: {removed_item['preview']}")
+
+def handle_echo(args):
+    history = load_history()
+    if not history:
+        sys.exit(0)
+        
+    list_index = args.index - 1  
+    if list_index < 0 or list_index >= len(history):
+        sys.exit(1)
+        
+    item = history[list_index]
+    # Print directly to stdout without adding a newline, perfect for piping
+    sys.stdout.write(item.get('content', ''))
+
+def handle_paste(args):
+    history = load_history()
+    if not history:
+        print("  Clipboard history is empty.")
+        sys.exit(0)
+        
+    target_index = args.index
+    
+    # FEATURE: FZF Interactive Mode
+    if target_index is None:
+        if not shutil.which("fzf"):
+            print("  Error: No index provided. Please provide an index (e.g., `paste 3`) or install fzf.")
+            sys.exit(1)
+            
+        # Format list for fzf
+        fzf_input = ""
+        for i, item in enumerate(history):
+            fzf_input += f"{i+1:02d}\t({item['type']}) {item['preview']}\n"
+            
+        try:
+            res = subprocess.run(
+                ['fzf', '--reverse', '--prompt', 'Select item to paste > '], 
+                input=fzf_input, capture_output=True, text=True
+            )
+            if res.returncode != 0:
+                sys.exit(0) # User pressed Esc
+            selected_line = res.stdout.strip().split('\t')[0]
+            target_index = int(selected_line)
+        except Exception as e:
+            print(f"  Error with fzf: {e}")
+            sys.exit(1)
+
+    list_index = target_index - 1  
+    
+    if list_index < 0 or list_index >= len(history):
+        print(f"  Error: Invalid index. Use a number between 1 and {len(history)}.")
+        sys.exit(1)
+        
+    item = history[list_index]
+    
+    if item["type"] == "Text":
+        try:
+            subprocess.run(['pbcopy'], input=item["content"].encode('utf-8'), check=True)
+            print(f"  Text pasted to clipboard!")
+        except Exception as e:
+            print(f"  Failed to paste text: {e}")
+    elif item["type"] == "File":
+        paths = item["content"].split("|")
+        for p in paths:
+            if not os.path.exists(p):
+                print(f"  Error: File no longer exists: {p}")
+                sys.exit(1)
+        try:
+            url_list = []
+            for p in paths:
+                safe_p = p.replace('"', '\\"')
+                url_list.append(f'(current application\'s NSURL\'s fileURLWithPath:"{safe_p}")')
+            urls_str = ", ".join(url_list)
+            script = f'''
+            use framework "AppKit"
+            use framework "Foundation"
+            set urlsList to {{{urls_str}}}
+            set urlsArray to current application's NSArray's arrayWithArray:urlsList
+            set pb to current application's NSPasteboard's generalPasteboard()
+            pb's clearContents()
+            pb's writeObjects:urlsArray
+            '''
+            res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            if res.returncode == 0:
+                print(f"  File(s) pasted to clipboard!")
+            else:
+                print(f"  Failed to paste file(s). macOS error:\n  {res.stderr.strip()}")
+        except Exception as e:
+            print(f"  Exception: {e}")
+            
+    try:
+        new_hash = get_clipboard_hash()
+        if new_hash:
+            save_state(last_hash=new_hash)
+    except:
+        pass
+
+def handle_reset(args):
+    state = load_state()
+    if "pid" in state:
+        try:
+            os.kill(state["pid"], signal.SIGTERM)
+            print("  Stopping clipd daemon...")
+            time.sleep(1)
+        except:
+            pass
+            
+    save_json(HISTORY_PATH, [])
+    state.pop("pid", None)
+    save_json(STATE_PATH, state)
+    print("  Clipboard history cleared.")
+
+# --- Main CLI ---
+
+def main():
+    parser = argparse.ArgumentParser(description="macOS clipboard history daemon.", add_help=False)
+    parser.add_argument("-h", "--help", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--daemon-run", action="store_true", help=argparse.SUPPRESS)
+
+    subparsers = parser.add_subparsers(dest="command", metavar='<command>')
+
+    subparsers.add_parser("watch", add_help=False)
+    subparsers.add_parser("stop", add_help=False)
+    subparsers.add_parser("status", add_help=False)
+    subparsers.add_parser("list", add_help=False)
+    subparsers.add_parser("reset", add_help=False)
+    
+    parser_paste = subparsers.add_parser("paste", add_help=False)
+    parser_paste.add_argument("index", type=int, nargs="?", help="1-based index from `clipd list`")
+
+    parser_search = subparsers.add_parser("search", add_help=False)
+    parser_search.add_argument("query", type=str, help="The word or phrase to search for")
+
+    parser_remove = subparsers.add_parser("remove", add_help=False)
+    parser_remove.add_argument("index", type=int, help="The 1-based index to delete")
+
+    parser_echo = subparsers.add_parser("echo", add_help=False)
+    parser_echo.add_argument("index", type=int, help="The 1-based index to echo to stdout")    
+
+    args = parser.parse_args()
+
+    if args.daemon_run:
+        run_daemon()
+        sys.exit(0)
+
+    if args.help or not args.command:
+        print(CUSTOM_HELP)
+        sys.exit(0)
+
+    if args.command == "watch":
+        handle_watch(args)
+    elif args.command == "stop":
+        handle_stop(args)
+    elif args.command == "status":
+        handle_status(args)
+    elif args.command == "list":
+        handle_list(args)
+    elif args.command == "paste":
+        handle_paste(args)
+    elif args.command == "reset":
+        handle_reset(args)
+    elif args.command == "search":  
+        handle_search(args)          
+    elif args.command == "remove":   
+        handle_remove(args)          
+    elif args.command == "echo":    
+        handle_echo(args)  
+
+if __name__ == "__main__":
+    main()
