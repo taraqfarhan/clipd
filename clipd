@@ -184,6 +184,16 @@ def categorize_item(content_type, content_data):
                     "content": text
                 }
                 
+            # Check if the path is a directory
+            if os.path.isdir(path):
+                return {
+                    "id": timestamp,
+                    "type": "Dir",
+                    "preview": path[:60] + ("..." if len(path) > 60 else ""),
+                    "content": path
+                }
+            
+            # Otherwise, it's a standard file
             filename = os.path.basename(path)
             return {
                 "id": timestamp,
@@ -192,11 +202,11 @@ def categorize_item(content_type, content_data):
                 "content": path
             }
         else:
-            # Multiple files
+            # Multiple files/directories
             return {
                 "id": timestamp,
                 "type": "File",
-                "preview": f"{len(paths)} files copied",
+                "preview": f"{len(paths)} items copied",
                 "content": "|".join(paths)
             }
             
@@ -267,8 +277,7 @@ def handle_watch(args):
 
     save_state(pid=proc.pid)
     print("  clipd daemon started in background. Watching clipboard.")
-    print("  (You can safely close this terminal. The daemon will persist.)")
-    print("  Run 'python3 clipd.py list' to see history.")
+    print("  Run 'clipd list' to see history.")
     sys.exit(0)
 
 def handle_stop(args):
@@ -407,11 +416,11 @@ def handle_paste(args):
             print(f"  Text pasted to clipboard!")
         except Exception as e:
             print(f"  Failed to paste text: {e}")
-    elif item["type"] == "File":
+    elif item["type"] in ("File", "Dir"):  # <--- Updated this line
         paths = item["content"].split("|")
         for p in paths:
             if not os.path.exists(p):
-                print(f"  Error: File no longer exists: {p}")
+                print(f"  Error: Path no longer exists: {p}")
                 sys.exit(1)
         try:
             url_list = []
@@ -430,9 +439,9 @@ def handle_paste(args):
             '''
             res = subprocess.run(['osascript', '-e', script], capture_output=True, text=True, stdin=subprocess.DEVNULL)
             if res.returncode == 0:
-                print(f"  File(s) pasted to clipboard!")
+                print(f"  Path(s) pasted to clipboard!")
             else:
-                print(f"  Failed to paste file(s). macOS error:\n  {res.stderr.strip()}")
+                print(f"  Failed to paste path(s). macOS error:\n  {res.stderr.strip()}")
         except Exception as e:
             print(f"  Exception: {e}")
             
